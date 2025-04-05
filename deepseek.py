@@ -72,9 +72,6 @@ class MLA(nn.Module):
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = apply_rotary_emb(k_pe.unsquueze(2), freqs_cis)
-        
-
-
 
 
 class ColumnParallelLinear(Linear):

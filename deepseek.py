@@ -1,3 +1,6 @@
+import torch
+import torch.nn as nn
+
 class MLA(nn.Module):
     """
         MLA(Multi-Headed-Attention-Layer) Attributes:
@@ -72,6 +75,84 @@ class MLA(nn.Module):
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = apply_rotary_emb(k_pe.unsquueze(2), freqs_cis)
+        if attn_impl == "naive":
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            kv = self.wkv_b(self.kv_norm(kv))
+            kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = torch.split(kv, (self.qk_nope_head_dim, self.v_head_dim), dim=-1)
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            self.k_cache[:bsz, start_pos:end_pos] = k
+            self.v_cache[:bsz, start_pos:end_pos] = v
+            scores = torch.einsum("bshd, bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
+        else:
+            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+            q_nope = torch.einsum("bshd, hdc->bshc", q_nope, wkv_b[:,:self.qk_nope_head_dim])
+            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
+            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            scores = (torch.einsum("bshd, btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos])+
+                      torch.einsum("bshr, btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+        if mask is not None:
+            scores += mask.unsqueeze(1)
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+        if attn_impl == "naive":
+            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+        else:
+            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim])
+        x = self.wo(x.flatten)
+class Gate:
+    """
+    Gating mechanisms for routing inputs in mixture-of-experts (MoE) model.
+
+    Attributes:
+        dim (int): Dimensionality of input features.
+        topk(int): number of top experts activated for each input.
+        n_groups(int): number of groups for routing.
+        topk_groups(int): Number of groups to route inputs to.
+        score_func(str): Scoring function('Softmax' or 'Sigmoid').
+        route_scale(float): Scaling factor for routing weights.
+        weight(torch.nn.Parameter): Learnable weights for the gate.
+    """
+    def __init__(self, args: ModelArgs):
+        """
+        Initialize the Gate module.
+
+        Args:
+            args(ModelArgs): Model argument containing gating parameters.
+        """
+        super().__init__()
+        self.dim = args.dim
+        self.topk = args.n_activated_experts
+        self.n_groups = args.n_expert_groups
+        self.topk_groups = args.n_limited_groups
+        self.score_func = args.score_func
+        self.route_scale = args.route_scale
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+        self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+            Forward pass for the gating mechanism.
+
+            Args:
+                x (torch.Tensor): Input Tensor.
+
+            Returns:
+                Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
+        """
+        scores = linear(x, self.weight)
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1, dtype=torch.float32)
+        else: 
+            scores = scores.sigmoid()
+        original_scores = scores
+        if self.bias is not None:
+            scores = scores + self.bias
+        if self.n_groups > 1:
+            scores = scores.view(x.size(0), self.n_groups, -1)
+            if self.bias is None:
+                group_scores = scores.amax(dim=-1)
 
 
 class ColumnParallelLinear(Linear):
@@ -103,3 +184,4 @@ class ColumnParallelLinear(Linear):
 
         y = linear(x, self.weight, self.bias)
         return y
+    

@@ -558,3 +558,5 @@ if __name__ == "__main__":
     x = torch.randint(0, args.vocab_size, (2, 128))
     model = Transformer(args)
     print(model(x).size())
+
+    """""""
